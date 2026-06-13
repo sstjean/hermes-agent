@@ -772,6 +772,12 @@ def check_command_security(command: str) -> dict:
             return {"action": "allow", "findings": [], "summary": "tirith path unavailable"}
         return {"action": "block", "findings": [], "summary": "tirith path unavailable (fail-closed)"}
 
+    # Tirith resolves its policy file by walking up from cwd and stops at
+    # .git boundaries.  When the gateway runs from inside a git repo (e.g.
+    # ~/.hermes/hermes-agent), the global policy at ~/.tirith/policy.yaml is
+    # unreachable.  Run tirith from $HOME so the walk finds it.
+    tirith_cwd = os.path.expanduser("~")
+
     try:
         result = subprocess.run(
             [tirith_path, "check", "--json", "--non-interactive",
@@ -780,6 +786,7 @@ def check_command_security(command: str) -> dict:
             text=True, encoding='utf-8', errors='replace',
             timeout=timeout,
             stdin=subprocess.DEVNULL,
+            cwd=tirith_cwd,
         )
     except OSError as exc:
         # Covers FileNotFoundError, PermissionError, exec format error.
