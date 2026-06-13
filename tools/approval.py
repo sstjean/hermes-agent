@@ -497,6 +497,41 @@ _SUDO_STDIN_RE = re.compile(
     r'(?:^|[;&|`\n]|&&|\|\||\$\()\s*sudo\s+-S\b',
     re.IGNORECASE)
 
+# `git branch -D` (force delete — drops unmerged commits) MUST stay gated, but
+# the safe `git branch -d` (merged-only delete; git refuses if unmerged, so it's
+# reflog-recoverable) MUST run gate-free (Steve, 2026-06-12). These can only be
+# told apart by FLAG CASE, so this is matched case-sensitively against the RAW
+# command — the DANGEROUS_PATTERNS loop lowercases first and cannot distinguish
+# them. `git` and `branch` keywords stay case-insensitive (only the flag is
+# case-sensitive). Covers clustered short flags in any order (-D, -Dr, -rD) and
+# the long form `--delete --force` / `--force --delete` (-> -D equivalent).
+_GIT_BRANCH_FORCE_DELETE_RE = re.compile(
+    r'(?i:\bgit\s+branch\b)'
+    r'(?='                       # the delete must be a force delete:
+    r'.*?(?:'
+    r'\s-[a-zA-Z]*D[a-zA-Z]*'    #   a short-flag cluster containing UPPERCASE D
+    r'|(?i:\s--delete\b).*?(?i:\s--force\b)'   #   --delete … --force (either order)
+    r'|(?i:\s--force\b).*?(?i:\s--delete\b)'
+    r')'
+    r')'
+)
+
+
+def _check_git_branch_force_delete(command: str) -> tuple:
+    """Detect `git branch -D` (force delete) case-sensitively on the raw command.
+
+    Gates force delete (drops unmerged work) while letting the safe merged-only
+    `git branch -d` run gate-free. Case matters, so this runs on the ORIGINAL
+    command, before the lowercasing that detect_dangerous_command applies.
+
+    Returns:
+        (is_dangerous: bool, description: str | None)
+    """
+    normalized = _normalize_command_for_detection(command)
+    if _GIT_BRANCH_FORCE_DELETE_RE.search(normalized):
+        return (True, "git branch force delete")
+    return (False, None)
+
 
 def _check_sudo_stdin_guard(command: str) -> tuple:
     """Detect ``sudo -S`` (stdin password) without configured SUDO_PASSWORD.
@@ -909,15 +944,27 @@ DANGEROUS_PATTERNS = [
     (r'\bgit\s+push\b.*--forc[a-z]*\b', "git force push (rewrites remote history)"),
     (r'\bgit\s+push\b.*-f\b', "git force push short flag (rewrites remote history)"),
     (r'\bgit\s+clean\s+-[^\s]*f', "git clean with force (deletes untracked files)"),
-    (r'\bgit\s+branch\s+-D\b', "git branch force delete"),
-    # `-D` is shorthand for `-d --force`; the long-flag spellings
-    # (`--delete`, `--force`) are different tokens entirely, so they slip
-    # past the `-D\b` pattern above even though `git branch -d --force`
-    # and `git branch --delete --force` delete an unmerged branch exactly
-    # like `-D` does. Match delete+force in either order, bounded to the
-    # same command segment (not spanning `;`/`|`/`&`/newline) the same
-    # way the sudo patterns below do, to avoid contaminating an unrelated
-    # later command in the same script.
+    # NOTE: `git branch -D` (force delete, single short-flag cluster) is
+    # matched case-sensitively by _check_git_branch_force_delete() against
+    # the RAW command, NOT here — the DANGEROUS_PATTERNS loop runs on a
+    # lowercased command (see detect_dangerous_command) and these patterns
+    # compile with IGNORECASE (_RE_FLAGS), so a plain `-D\b` entry here would
+    # also match the safe lowercase -d (merged-only delete). #106-followup /
+    # Steve 2026-06-12: -d must run gate-free, only -D gates. A
+    # case-insensitive pattern here cannot tell them apart.
+    #
+    # `-D` is shorthand for `-d --force`; the SEPARATED long/short spellings
+    # (`-d ... -f`, `--delete ... --force`) are different tokens entirely, so
+    # they need their own coverage even though `git branch -d -f` and
+    # `git branch --delete --force` delete an unmerged branch exactly like
+    # `-D` does. These are safe to keep case-insensitive here because they
+    # require BOTH a delete token AND a force token in the same command
+    # segment — a lone `-d` (no accompanying `-f`/`--force`) never matches,
+    # so the safe merged-only delete still runs gate-free. Bounded to the
+    # same command segment (not spanning `;`/`|`/`&`/newline) the same way
+    # the sudo patterns below do, to avoid contaminating an unrelated later
+    # command in the same script. (Upstream #56xxx, merged onto our
+    # case-sensitive -D fix during the v0.18.0 update — 2026-07-06.)
     (r'\bgit\s+branch\b[^;|&\n]*?(?:-d\b|--delete\b)[^;|&\n]*?(?:-f\b|--force\b)', "git branch force delete (long flags)"),
     (r'\bgit\s+branch\b[^;|&\n]*?(?:-f\b|--force\b)[^;|&\n]*?(?:-d\b|--delete\b)', "git branch force delete (long flags, force-first)"),
     # Script execution after chmod +x — catches the two-step pattern where
@@ -2183,6 +2230,14 @@ def detect_dangerous_command(command: str) -> tuple:
     if _is_verification_artifact_cleanup(command):
         return (False, None, None)
 
+    # Case-sensitive guard FIRST, on the RAW command: `git branch -D` (force
+    # delete) must gate, but `git branch -d` (safe merged-only delete) must
+    # not. The variant/pattern loop below lowercases every variant it
+    # produces, which would conflate -D and -d if the guard ran after it —
+    # so this must run before _command_detection_variants is consulted.
+    is_force_delete, fd_desc = _check_git_branch_force_delete(command)
+    if is_force_delete:
+        return (True, fd_desc, fd_desc)
     for command_variant in _command_detection_variants(command):
         command_lower = command_variant.lower()
         for pattern_re, description in DANGEROUS_PATTERNS_COMPILED:
