@@ -1891,7 +1891,22 @@ def _generate_openai_tts(
     response_format = _tts_response_format_from_path(output_path)
 
     OpenAIClient = _import_openai_client()
-    client = OpenAIClient(api_key=api_key, base_url=base_url)
+    # Use AzureOpenAI client when Azure Foundry is configured (Entra auth)
+    azure = _resolve_azure_foundry_config()
+    if azure:
+        _token, azure_endpoint, azure_api_version = azure
+        from openai import AzureOpenAI
+        from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+        token_provider = get_bearer_token_provider(
+            DefaultAzureCredential(), "https://cognitiveservices.azure.com/.default"
+        )
+        client = AzureOpenAI(
+            azure_ad_token_provider=token_provider,
+            azure_endpoint=azure_endpoint,
+            api_version=azure_api_version,
+        )
+    else:
+        client = OpenAIClient(api_key=api_key, base_url=base_url)
     try:
         create_kwargs: Dict[str, Any] = {
             "model": model,
@@ -3780,6 +3795,25 @@ def check_tts_requirements() -> bool:
         return False
 
 
+def _resolve_azure_foundry_config() -> "tuple[str, str, str] | None":
+    """Check if Azure Foundry TTS is configured. Returns (token, endpoint, api_version) or None."""
+    tts_config = _load_tts_config()
+    oai_config = tts_config.get("openai", {})
+    azure_endpoint = oai_config.get("azure_endpoint", "")
+    if not azure_endpoint:
+        return None
+    api_version = oai_config.get("api_version", "2025-03-01-preview")
+    try:
+        from azure.identity import DefaultAzureCredential
+        cred = DefaultAzureCredential()
+        token = cred.get_token("https://cognitiveservices.azure.com/.default")
+        return token.token, azure_endpoint, api_version
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"Azure Foundry credential failed: {e}")
+        return None
+
+
 def _resolve_openai_audio_client_config() -> tuple[str, str, bool]:
     """Return ``(api_key, base_url, is_managed)`` for the OpenAI audio client.
 
@@ -3788,12 +3822,29 @@ def _resolve_openai_audio_client_config() -> tuple[str, str, bool]:
     gateway supports. When ``tts.use_gateway`` is set the gateway is preferred
     even if direct OpenAI credentials are present.
 
-    Resolution order (mirrors the STT resolver):
-    1. ``tts.openai.api_key`` / ``tts.openai.base_url`` from ``config.yaml``
-    2. ``VOICE_TOOLS_OPENAI_KEY`` / ``OPENAI_API_KEY`` environment variables
+    Azure Foundry (our infra) is checked FIRST, ahead of the config-key,
+    direct-env-var, and managed-gateway paths below — it's an explicit
+    enterprise credential the operator configured, not a fallback, so it
+    always wins when present. It is never "managed" in the gateway-proxy
+    sense (that flag exists purely to let callers coerce requests to the
+    Nous gateway's supported shape) — Azure Foundry has no such restriction,
+    so ``is_managed`` is False for this path.
+
+    Resolution order (mirrors the STT resolver, with Azure Foundry ahead of it):
+    1. Azure Foundry Entra ID (``tts.openai.azure_endpoint``)
+    2. ``tts.openai.api_key`` / ``tts.openai.base_url`` from ``config.yaml``
+    3. ``VOICE_TOOLS_OPENAI_KEY`` / ``OPENAI_API_KEY`` environment variables
        (still honoring ``tts.openai.base_url`` when set)
-    3. Managed OpenAI audio tool gateway
+    4. Managed OpenAI audio tool gateway
     """
+    # Try Azure Foundry first — our infra takes priority over both direct
+    # OpenAI credentials and the managed gateway fallback below.
+    azure = _resolve_azure_foundry_config()
+    if azure:
+        token, endpoint, api_version = azure
+        base_url = f"{endpoint.rstrip('/')}/openai"
+        return token, base_url, False
+
     tts_config = _load_tts_config()
     openai_cfg = (tts_config.get("openai") if isinstance(tts_config, dict) else None) or {}
     cfg_api_key = openai_cfg.get("api_key") or ""
