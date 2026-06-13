@@ -879,6 +879,132 @@ class TestGitDestructiveOps:
             dangerous, _, _ = detect_dangerous_command(cmd)
             assert dangerous is False, cmd
 
+    def test_git_reset_help_not_flagged(self):
+        """--help must not resolve as an abbreviation of --hard."""
+        cmd = "git reset --help"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is False
+
+    def test_git_push_force_detected(self):
+        cmd = "git push --force origin main"
+        dangerous, _, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+        assert "force" in desc.lower()
+
+    def test_git_push_dash_f_detected(self):
+        cmd = "git push -f origin main"
+        dangerous, _, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    def test_git_clean_force_detected(self):
+        cmd = "git clean -fd"
+        dangerous, _, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+        assert "clean" in desc.lower()
+
+    def test_git_branch_force_delete_detected(self):
+        cmd = "git branch -D feature-branch"
+        dangerous, _, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    def test_safe_git_status_not_flagged(self):
+        cmd = "git status"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is False
+
+    def test_safe_git_push_not_flagged(self):
+        """Normal push without --force must not be flagged."""
+        cmd = "git push origin main"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is False
+
+    def test_git_branch_merged_delete_lowercase_d_NOT_flagged(self):
+        """git branch -d (merged-only delete) must NOT trigger approval.
+
+        -d refuses to delete a branch with unmerged commits (git errors out),
+        so the deletion is reflog-recoverable and safe to run gate-free. Only
+        -D (force delete, drops unmerged work) stays gated. -D is matched
+        case-sensitively by _check_git_branch_force_delete() against the RAW
+        command, because detect_dangerous_command lowercases before running the
+        DANGEROUS_PATTERNS loop — which would otherwise conflate -D and -d.
+
+        (Supersedes the prior decision that gated -d too — Steve, 2026-06-12.)
+        """
+        cmd = "git branch -d feature-branch"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is False
+
+    def test_git_branch_force_delete_stays_gated_after_d_carveout(self):
+        """The -d carve-out must NOT weaken -D: force delete still gates.
+
+        Negative-control companion to the test above — proves the case-sensitive
+        flag didn't accidentally stop matching the uppercase force-delete.
+        """
+        for cmd in ("git branch -D feature-branch", "git branch  -D  x", "GIT BRANCH -D y"):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is True, f"force delete must stay gated: {cmd!r}"
+
+    def test_git_branch_force_delete_command_keywords_case_insensitive(self):
+        """Only the -D FLAG is case-sensitive; the git/branch keywords are not.
+
+        `GIT BRANCH -D` must still gate (keyword casing is irrelevant), but a
+        lowercase -d flag must not — that's the whole point of the carve-out.
+        """
+        assert detect_dangerous_command("Git Branch -D z")[0] is True
+        assert detect_dangerous_command("GIT BRANCH -d z")[0] is False
+
+    def test_git_branch_force_delete_clustered_and_longform_flags(self):
+        """Force delete gates regardless of flag spelling; safe spellings don't.
+
+        Locks in the case-sensitive guard's coverage of the real shapes git
+        accepts: clustered short flags in any order (-Dr, -rD) and the long
+        form `--delete --force` (either order). Negative controls: a lowercase
+        short cluster (-dr) and `--delete` alone are merged-only → gate-free.
+        """
+        gated = [
+            "git branch -Dr feature",
+            "git branch -rD feature",
+            "git branch --delete --force feature",
+            "git branch --force --delete feature",
+        ]
+        for cmd in gated:
+            assert detect_dangerous_command(cmd)[0] is True, f"must gate: {cmd!r}"
+        allowed = [
+            "git branch -dr feature",          # lowercase cluster = merged-only
+            "git branch --delete feature",     # plain --delete = merged-only
+            "git checkout -D",                 # not a branch delete at all
+        ]
+        for cmd in allowed:
+            assert detect_dangerous_command(cmd)[0] is False, f"must NOT gate: {cmd!r}"
+
+    def test_git_branch_long_flag_delete_force_detected(self):
+        # `--delete --force` performs the exact same unmerged-branch force
+        # delete as `-D` (verified live), but is a different token
+        # spelling entirely so the `-D\b` pattern never sees it.
+        cmd = "git branch --delete --force feature-branch"
+        dangerous, _, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+        assert "force delete" in desc.lower()
+
+    def test_git_branch_short_delete_long_force_detected(self):
+        # `-d --force` is git's own documented equivalent of `-D`.
+        cmd = "git branch -d --force feature-branch"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    def test_git_branch_force_first_delete_detected(self):
+        cmd = "git branch --force --delete feature-branch"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    def test_git_branch_long_delete_without_force_not_flagged(self):
+        """Plain --delete (merged-only, equivalent to -d) has no force
+        token, so the new combined delete+force patterns must not fire —
+        only an actual force flag alongside it should trigger."""
+        cmd = "git branch --delete feature-branch"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is False
+
 
 class TestChmodExecuteCombo:
     """chmod +x && ./ is the two-step social engineering pattern where a
