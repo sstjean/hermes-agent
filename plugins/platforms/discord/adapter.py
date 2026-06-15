@@ -7754,7 +7754,20 @@ class DiscordAdapter(BasePlatformAdapter):
 
             if require_mention and not is_free_channel and not in_bot_thread:
                 if not self._self_is_explicitly_mentioned(message) and not mention_prefix:
-                    return False
+                    # Before dropping the message, check if there is an already-
+                    # validated pending batch for this session.  When Discord splits
+                    # a long message at 2000 chars, only part 1 carries the @mention;
+                    # parts 2+ arrive mention-free milliseconds later.  Part 1 already
+                    # passed the mention gate and was queued in _pending_text_batches.
+                    # If a pending batch exists under the same session key, this message
+                    # is a split continuation — let it through so the batching layer can
+                    # concatenate all parts before dispatching. (Merged onto upstream's
+                    # _self_is_explicitly_mentioned() helper during v0.18.0 update —
+                    # 2026-07-06; the raw `self._client.user not in message.mentions`
+                    # check this local patch originally gated on has been superseded
+                    # upstream, but the split-batch fallback logic is unchanged.)
+                    if not self._has_pending_split_batch(message, thread_id=thread_id):
+                        return
         # Auto-thread: when enabled, automatically create a thread for every
         # @mention in a text channel so each conversation is isolated (like Slack).
         # Messages already inside threads or DMs are unaffected.
@@ -8152,6 +8165,46 @@ class DiscordAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
     # Text message aggregation (handles Discord client-side splits)
     # ------------------------------------------------------------------
+
+    def _has_pending_split_batch(self, message: DiscordMessage, thread_id: Optional[str]) -> bool:
+        """Return True if a pending text batch exists for the session this message belongs to.
+
+        Used to pass split-message continuations through the require_mention gate:
+        when Discord fragments a long message at 2000 chars, only part 1 carries
+        the @mention.  Parts 2+ arrive without a mention a few hundred milliseconds
+        later.  Part 1 has already been queued in _pending_text_batches after
+        passing all auth checks; if a batch is pending for the same session, this
+        message is a continuation — not a new unauthorised request.
+
+        The key is built to match _text_batch_key() exactly: we replicate the
+        build_session_key() logic for the Discord/group case so we can check
+        _pending_text_batches without needing a full MessageEvent.
+        """
+        from gateway.session import build_session_key
+        from gateway.platforms.base import SessionSource
+
+        channel = message.channel
+        is_thread = isinstance(channel, discord.Thread)
+        if is_thread:
+            chat_id = str(channel.parent_id) if getattr(channel, "parent_id", None) else str(channel.id)
+            effective_thread_id = str(channel.id)
+        else:
+            chat_id = str(channel.id)
+            effective_thread_id = thread_id
+
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id=chat_id,
+            chat_type="thread" if is_thread else "group",
+            user_id=str(message.author.id),
+            thread_id=effective_thread_id,
+        )
+        key = build_session_key(
+            source,
+            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+        )
+        return key in self._pending_text_batches
 
     def _text_batch_key(self, event: MessageEvent) -> str:
         """Session-scoped key for text message batching.
