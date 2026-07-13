@@ -1810,6 +1810,7 @@ def init_agent(
     compression_enabled = str(_compression_cfg.get("enabled", True)).lower() in {"true", "1", "yes"}
     compression_target_ratio = float(_compression_cfg.get("target_ratio", 0.20))
     compression_protect_last = int(_compression_cfg.get("protect_last_n", 20))
+    compression_min_tail_users = int(_compression_cfg.get("min_tail_user_messages", 3))
     # Cap on compression retry rounds before a turn gives up with "max
     # compression attempts reached" (compression.max_attempts).  Hardcoding 3
     # strands sessions that legitimately need more rounds — e.g. a restart
@@ -2312,6 +2313,7 @@ def init_agent(
             max_tokens=agent.max_tokens,
             model_thresholds=compression_model_thresholds,
             threshold_tokens_cap=compression_threshold_tokens,
+            min_tail_user_messages=compression_min_tail_users,
         )
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
     if callable(_bind_session_state):
