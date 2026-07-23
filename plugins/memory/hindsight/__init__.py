@@ -999,7 +999,8 @@ class HindsightMemoryProvider(MemoryProvider):
             idle_timeout_val = existing_idle_timeout if existing_idle_timeout is not None else _DEFAULT_IDLE_TIMEOUT
             provider_config["idle_timeout"] = idle_timeout_val
             env_writes["HINDSIGHT_IDLE_TIMEOUT"] = str(idle_timeout_val)
-        config["memory"]["provider"] = "hindsight"
+        from hermes_cli.config import set_active_memory_providers
+        set_active_memory_providers(config, ["hindsight"])
         save_config(config)
 
         self.save_config(provider_config, hermes_home)

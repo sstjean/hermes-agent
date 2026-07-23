@@ -621,7 +621,8 @@ class SupermemoryMemoryProvider(MemoryProvider):
 
         if not isinstance(config.get("memory"), dict):
             config["memory"] = {}
-        config["memory"]["provider"] = self.name
+        from hermes_cli.config import set_active_memory_providers
+        set_active_memory_providers(config, [self.name])
         save_config(config)
 
         if env_writes:
