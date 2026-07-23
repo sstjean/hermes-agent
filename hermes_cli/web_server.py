@@ -475,20 +475,61 @@ def should_require_auth(host: str, allow_public: bool = False) -> bool:
 
     Truth table:
       host == loopback        → False (no auth — local-only, trusted operator)
-      host != loopback        → True  (gate engages — OAuth or password required)
+      host != loopback        → True, UNLESS dashboard.trust_bind (below)
 
     "Loopback" is 127.0.0.1, localhost, ::1. RFC1918 / CGNAT / link-local are
-    deliberately treated as PUBLIC — a hostile device on the same LAN is exactly
-    the threat model the gate is designed for.
+    deliberately treated as PUBLIC by default — a hostile device on the same
+    LAN is exactly the threat model the gate is designed for.
 
-    ``allow_public`` (the legacy ``--insecure`` escape hatch) NO LONGER disables
+    ``allow_public`` (the legacy ``--insecure`` escape hatch) does NOT disable
     the gate. It is accepted for backward-compat with old launch scripts and
-    desktop shells but is ignored: a non-loopback bind ALWAYS requires an auth
-    provider (OAuth or the bundled password provider). This closes the
+    desktop shells but is ignored: a non-loopback bind requires an auth
+    provider (OAuth or the bundled password provider) UNLESS the operator has
+    made an explicit, documented, config.yaml-level assertion that the bind
+    sits behind a compensating network perimeter it does not own or control
+    from Python (see ``dashboard.trust_bind`` below). This closes the
     unauthenticated-public-dashboard hole behind the June 2026 ``hermes-0day``
     MCP-persistence campaign, where ``--insecure --host 0.0.0.0`` left the
-    config/MCP/agent surface open to internet scanners.
+    config/MCP/agent surface open to internet scanners with NO network-level
+    control in front of it at all.
+
+    --- LOCAL PATCH #10 (Ophelia, 2026-07-22, Steve-approved) ---------------
+    This gate is a blunt binary: it can't distinguish "bound 0.0.0.0 directly
+    on the open internet" from "bound 0.0.0.0 behind a hardware firewall that
+    is the actual network perimeter, with no internet path to this host at
+    all." Our deployment is the second case (Ubiquiti UniFi UDM Pro NextGen
+    firewall fronting the entire LAN; see accepted-risks.md § Perimeter) and
+    was an explicit, twice-reaffirmed accepted risk (2026-06-09, reaffirmed
+    2026-07-18) before this gate made that posture unachievable without
+    either UX friction (basic_auth) or a LAN-availability regression
+    (loopback-only, ISP-outage lockout) — both explicitly rejected by Steve.
+
+    Rather than blanket-disabling the gate (which would remove it for every
+    future bind on this box regardless of network context), this adds a
+    single explicit opt-in read from config.yaml: ``dashboard.trust_bind:
+    true``. Setting it is a deliberate, visible, version-controlled
+    assertion that a compensating network-level perimeter exists — it is NOT
+    a default and does not change behavior for anyone who hasn't set it.
     """
+    if host not in _LOOPBACK_HOST_VALUES:
+        try:
+            from hermes_cli.config import cfg_get, load_config
+
+            trust_bind = bool(
+                cfg_get(load_config(), "dashboard", "trust_bind", default=False)
+            )
+        except Exception:
+            trust_bind = False
+        if trust_bind:
+            _log.warning(
+                "Dashboard auth gate BYPASSED for host %s — "
+                "dashboard.trust_bind=true in config.yaml. This is a "
+                "deliberate operator assertion that a compensating "
+                "network-level perimeter (firewall) sits in front of this "
+                "bind. Do not set this unless that is actually true.",
+                host,
+            )
+            return False
     return host not in _LOOPBACK_HOST_VALUES
 
 
