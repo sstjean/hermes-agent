@@ -371,7 +371,6 @@ class MemoryManager:
     def __init__(self, *, external_prefetch_timeout: Optional[float] = None) -> None:
         self._providers: List[MemoryProvider] = []
         self._tool_to_provider: Dict[str, MemoryProvider] = {}
-        self._has_external: bool = False  # True once a non-builtin provider is added
         self._external_prefetch_timeout = (
             _EXTERNAL_PREFETCH_TIMEOUT_S
             if external_prefetch_timeout is None
@@ -405,26 +404,18 @@ class MemoryManager:
         """Register a memory provider.
 
         Built-in provider (name ``"builtin"``) is always accepted.
-        Only **one** external (non-builtin) provider is allowed — a second
-        attempt is rejected with a warning.
+        Multiple external (non-builtin) providers can be registered
+        and will run simultaneously.
+
+        Local patch (#10 / upstream #5688): the v0.19.0 base re-introduced a
+        single-external-provider gate (``_has_external``) that rejected a second
+        provider. That gate blocks our always-on INDEX provider from
+        coexisting with holographic (config ``memory.providers: [index,
+        holographic]``). The unlock is re-derived here: registration is
+        unconditional; the MemoryManager already iterates ALL providers for
+        prefetch/sync/tool-routing/system-prompt/lifecycle, so lifting the gate
+        is sufficient. See local-patch-registry.md #10.
         """
-        is_builtin = provider.name == "builtin"
-
-        if not is_builtin:
-            if self._has_external:
-                existing = next(
-                    (p.name for p in self._providers if p.name != "builtin"), "unknown"
-                )
-                logger.warning(
-                    "Rejected memory provider '%s' — external provider '%s' is "
-                    "already registered. Only one external memory provider is "
-                    "allowed at a time. Configure which one via memory.provider "
-                    "in config.yaml.",
-                    provider.name, existing,
-                )
-                return
-            self._has_external = True
-
         self._providers.append(provider)
 
         # Core tool names are reserved — a memory provider must never register

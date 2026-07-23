@@ -1723,20 +1723,63 @@ def init_agent(
     
 
 
-    # Memory provider plugin (external — one at a time, alongside built-in)
-    # Reads memory.provider from config to select which plugin to activate.
+    # Memory provider plugin(s) (external — MULTIPLE allowed, alongside built-in).
+    # Local patch (#10 / upstream #5688): read the ORDERED memory.providers list
+    # (list-order == injection/priority order) with a legacy single-string
+    # memory.provider fallback. The v0.19.0 base regressed this seam to load a
+    # single provider only, which prevents our always-on INDEX provider from
+    # coexisting with holographic. Re-derived from pre-bump 9a6d1bea6.
+    # See local-patch-registry.md #10.
     agent._memory_manager = None
     if not skip_memory:
         try:
-            _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
+            # Read providers list; fall back to legacy single-string field.
+            _mem_provider_names = (mem_config.get("providers", []) or []) if mem_config else []
+            _mem_provider_names = [p for p in _mem_provider_names if p and p.strip()]
+            if not _mem_provider_names and mem_config:
+                _legacy = mem_config.get("provider", "")
+                if _legacy and _legacy.strip():
+                    _mem_provider_names = [_legacy.strip()]
 
-            if _mem_provider_name and _mem_provider_name.strip():
+            # Auto-migrate: if Honcho was actively configured (enabled +
+            # credentials) but memory.providers is not set, activate the
+            # honcho plugin automatically. Just having the config file is not
+            # enough — the user may have disabled Honcho or the file may be
+            # from a different tool.
+            #
+            # Respect an EXPLICIT opt-out: if the memory config block already
+            # carries a `provider` or `providers` key (even blank/empty), the
+            # user made a deliberate selection — do NOT auto-migrate over it.
+            _explicit_mem_choice = bool(mem_config) and (
+                "provider" in mem_config or "providers" in mem_config
+            )
+            if not _mem_provider_names and not _explicit_mem_choice:
+                try:
+                    from plugins.memory.honcho.client import HonchoClientConfig as _HCC
+                    _hcfg = _HCC.from_global_config()
+                    if _hcfg.enabled and (_hcfg.api_key or _hcfg.base_url):
+                        _mem_provider_names = ["honcho"]
+                        try:
+                            from hermes_cli.config import load_config as _lc, save_config as _sc
+                            _cfg = _lc()
+                            _cfg.setdefault("memory", {})["providers"] = ["honcho"]
+                            _sc(_cfg)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+            if _mem_provider_names:
                 from agent.memory_manager import MemoryManager as _MemoryManager
                 from plugins.memory import load_memory_provider as _load_mem
                 agent._memory_manager = _MemoryManager()
-                _mp = _load_mem(_mem_provider_name)
-                if _mp and _mp.is_available():
-                    agent._memory_manager.add_provider(_mp)
+                # Registration order == injection/priority order (list order).
+                for _mpn in _mem_provider_names:
+                    _mp = _load_mem(_mpn)
+                    if _mp and _mp.is_available():
+                        agent._memory_manager.add_provider(_mp)
+                    else:
+                        _ra().logger.debug("Memory provider '%s' not found or not available", _mpn)
                 if agent._memory_manager.providers:
                     _init_kwargs = {
                         "session_id": agent.session_id,
@@ -1783,9 +1826,9 @@ def init_agent(
                     except Exception:
                         pass
                     agent._memory_manager.initialize_all(**_init_kwargs)
-                    _ra().logger.info("Memory provider '%s' activated", _mem_provider_name)
+                    _ra().logger.info("Memory providers %s activated", [p.name for p in agent._memory_manager.providers])
                 else:
-                    _ra().logger.debug("Memory provider '%s' not found or not available", _mem_provider_name)
+                    _ra().logger.debug("No memory providers available from %s", _mem_provider_names)
                     agent._memory_manager = None
         except Exception as _mpe:
             _ra().logger.warning("Memory provider plugin init failed: %s", _mpe)
