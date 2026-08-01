@@ -141,6 +141,13 @@ def _run_update_until_guard(args):
         cli_main, "_orphaned_desktop_backend_pids", return_value=None
     ), patch.object(
         cli_main, "PROJECT_ROOT", _RootSentinel()
+    ), patch.object(
+        # Hard backstop for the gate-HEAD-hijack hazard (Taro's root cause): the
+        # branch-switch source guard always refuses under this test, so even if
+        # a leaky polluter earlier in the run lets execution slip past the venv
+        # guard and reach the branch-switch, it can never mutate the real repo
+        # HEAD. Keeps this test from being hostage to cross-test isolation.
+        cli_main, "_pytest_owns_live_checkout", return_value=True
     ):
         try:
             cli_main._cmd_update_impl(args, gateway_mode=False)
