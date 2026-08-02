@@ -4106,8 +4106,13 @@ def run_job(
             # Without a workdir, keep cwd context discovery disabled.
             skip_context_files=not bool(_job_workdir),
             load_soul_identity=True,
-            skip_memory=True,  # Cron system prompts would corrupt user representations
             skip_background_review=True,  # Cron has no human-in-the-loop need for skill/memory review forks (~30K tok/event)
+            # Cron system prompts would corrupt user representations by
+            # default, so memory stays off unless a job explicitly opts in
+            # via allow_memory: true (scoped override, PR #47 / local patch
+            # registry entry "allow_memory-cron-flag" — re-verify this line
+            # survives every future base bump, see local-patch-upstream-tracking.md).
+            skip_memory=not bool(job.get("allow_memory", False)),
             platform="cron",
             session_id=_cron_session_id,
             session_db=_session_db,
