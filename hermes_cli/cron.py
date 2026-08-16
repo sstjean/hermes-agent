@@ -472,7 +472,16 @@ def _job_action(action: str, job_id: str, success_verb: str) -> int:
         print(f"  Next run: {result['job']['next_run_at']}")
     if action == "run":
         job = result.get("job", {})
-        if job.get("executed"):
+        if job.get("execution_mode") == "background":
+            # Background dispatch (delegate_task-style): the run was queued and
+            # its outcome re-enters the conversation as a completion event when
+            # it finishes. There is no synchronous success/failed to report yet,
+            # so never force the succeeded/failed binary here — the background
+            # path deliberately does not set ``execution_success`` (deploy#59).
+            deleg = job.get("delegation_id")
+            suffix = f" (delegation {deleg})" if deleg else ""
+            print(f"  Dispatched to background{suffix} — check status separately.")
+        elif job.get("executed"):
             outcome = "succeeded" if job.get("execution_success") else "failed"
             print(f"  Ran now: {outcome}.")
         elif job.get("execution_skipped"):
