@@ -456,6 +456,19 @@ class ProcessRegistry:
         except Exception as exc:
             logger.warning("Could not restore async delegation completions: %s", exc)
 
+        # Periodically reap durable delegations whose owning process has died
+        # (deploy#59). A CLI worker that dispatched a background run and then
+        # exited — while its turn never started — leaves a cross-process orphan
+        # stuck at state=running forever. The startup restore above only runs
+        # once; this daemon re-runs the same owner-pid liveness scan on an
+        # interval so such rows self-heal to 'unknown' without a restart or
+        # manual DB surgery.
+        try:
+            from tools.async_delegation import ensure_durable_reaper
+            ensure_durable_reaper()
+        except Exception as exc:
+            logger.warning("Could not start async delegation durable reaper: %s", exc)
+
         # Track sessions whose completion was already consumed by the agent
         # via wait/log.  Drain loops AND gateway/tui watchers skip notifications
         # for these — a blocking wait() or a full read_log() means the agent
