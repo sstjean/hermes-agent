@@ -115,6 +115,24 @@ _monitor_lock = threading.Lock()
 _monitor_thread: Optional[threading.Thread] = None
 _monitor_stop = threading.Event()
 
+# ---------------------------------------------------------------------------
+# Periodic durable owner-pid reaper
+# ---------------------------------------------------------------------------
+# recover_abandoned_delegations() classifies a durable ``running`` row whose
+# owning process has exited as ``unknown`` (its outcome can never be observed).
+# It runs once at registry startup (restore_undelivered_completions), but a
+# long-lived gateway also needs to reap owners that die MID-run: the CLI worker
+# that dispatched the delegation exits within seconds while the turn never
+# started (deploy#59), leaving a cross-process orphan sitting at ``running``
+# forever. This lightweight daemon re-runs the same liveness scan on an
+# interval so a dead-owner row self-heals without a restart or manual DB
+# surgery. It is independent of the in-memory ``_records`` (the orphan lives in
+# a DIFFERENT process's ledger, so this process has no in-memory record for it).
+_REAPER_INTERVAL_SECONDS = 60.0
+_reaper_lock = threading.Lock()
+_reaper_thread: Optional[threading.Thread] = None
+_reaper_stop = threading.Event()
+
 
 def _db_path():
     return get_hermes_home() / "state.db"
@@ -1156,6 +1174,64 @@ def _ensure_stale_monitor() -> None:
             daemon=True,
         )
         _monitor_thread.start()
+
+
+def _durable_reaper_tick() -> int:
+    """One reaper pass: reclassify dead-owner ``running`` durable rows.
+
+    Delegates to ``recover_abandoned_delegations`` (the single owner-pid
+    liveness scan) so the classification rule lives in exactly one place.
+    Best-effort — a transient DB error must not kill the reaper thread.
+    """
+    try:
+        return recover_abandoned_delegations()
+    except Exception as exc:  # pragma: no cover — defensive
+        logger.debug("Durable delegation reaper tick failed: %s", exc)
+        return 0
+
+
+def _durable_reaper_loop() -> None:
+    """Periodically reap durable delegations whose owning process has died.
+
+    Unlike the stale monitor (which watches IN-memory progress and exits when
+    no monitorable records remain), this runs for the life of the process: the
+    orphan it heals was dispatched by a DIFFERENT, now-dead process, so it never
+    appears in this process's ``_records``. Ticks on a fixed interval.
+    """
+    # Reap once immediately so a row orphaned just before this thread started
+    # is not left waiting a full interval.
+    _durable_reaper_tick()
+    while not _reaper_stop.wait(_REAPER_INTERVAL_SECONDS):
+        _durable_reaper_tick()
+
+
+def ensure_durable_reaper() -> None:
+    """Start (once) the module-level periodic durable owner-pid reaper.
+
+    Idempotent and safe to call from any entrypoint that owns the durable
+    ledger (the process_registry startup, a gateway boot). A single daemon
+    thread serves the whole process.
+    """
+    global _reaper_thread
+    with _reaper_lock:
+        if _reaper_thread is not None and _reaper_thread.is_alive():
+            return
+        _reaper_stop.clear()
+        _reaper_thread = threading.Thread(
+            target=_durable_reaper_loop,
+            name="async-delegate-durable-reaper",
+            daemon=True,
+        )
+        _reaper_thread.start()
+
+
+def stop_durable_reaper() -> None:
+    """Signal the durable reaper to stop (used on shutdown / in tests)."""
+    _reaper_stop.set()
+    with _reaper_lock:
+        thread = _reaper_thread
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=2.0)
 
 
 def _stale_monitor_loop() -> None:
